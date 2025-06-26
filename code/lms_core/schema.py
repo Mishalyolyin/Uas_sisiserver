@@ -73,7 +73,7 @@ class CourseContentMini(Schema):
     id: int
     name: str
     description: str
-    course_id: CourseSchemaOut
+    course_id: int
     created_at: datetime
     updated_at: datetime
 
@@ -107,7 +107,6 @@ class CompletionOut(Schema):
     id: int
     user_id: int
     content_id: int
-    created_at: datetime
 
 # -------- Profile Schemas --------
 class ProfileOut(Schema):
@@ -143,7 +142,6 @@ class CategoryOut(Schema):
 
 # -------- Bookmark Schemas --------
 class BookmarkIn(Schema):
-    # body empty, content_id from path
     pass
 
 class BookmarkOut(Schema):

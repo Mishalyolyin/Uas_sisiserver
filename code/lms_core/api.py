@@ -25,11 +25,11 @@ from lms_core.models import (
     Category, Bookmark, Feedback
 )
 
-# Initialize API and JWT Auth
 apiv1 = NinjaAPI()
 auth = HttpJwtAuth()
 
-# ─── AUTH ROUTER: JWT + REGISTER ───────────────────────────
+
+# ─── AUTH ─────────────────────────────────────────────────
 auth_router = Router()
 auth_router.add_router("", mobile_auth_router)
 
@@ -37,16 +37,13 @@ auth_router.add_router("", mobile_auth_router)
 def register(request, data: RegisterInput):
     if User.objects.filter(username=data.username).exists():
         return {"success": False, "message": "Username sudah digunakan.", "user": None}
-    user = User.objects.create_user(
-        username=data.username,
-        email=data.email,
-        password=data.password
-    )
+    user = User.objects.create_user(data.username, data.email, data.password)
     return {"success": True, "message": f"User {user.username} berhasil didaftarkan.", "user": user}
 
 apiv1.add_router("/auth/", auth_router)
 
-# ─── COURSE ROUTER: Batch Enroll Students ──────────────────
+
+# ─── BATCH ENROLL ───────────────────────────────────────────
 enroll_router = Router(auth=auth)
 
 @enroll_router.post("/batch-enroll", response=BatchEnrollOutput)
@@ -54,22 +51,35 @@ def batch_enroll(request, data: BatchEnrollInput):
     course = Course.objects.filter(id=data.course_id).first()
     if not course:
         return {"success": False, "message": "Course not found.", "enrolled": []}
-    enrolled = []
+
+    enrolled_payload = []
     for uid in data.user_ids:
         user = User.objects.filter(id=uid).first()
         if not user:
             continue
         member, _ = CourseMember.objects.get_or_create(
-            course_id=course,
-            user_id=user,
+            course=course,
+            user=user,
             defaults={"roles": data.roles}
         )
-        enrolled.append(member)
-    return {"success": True, "message": f"{len(enrolled)} user(s) enrolled.", "enrolled": enrolled}
+        # return plain IDs to match schema
+        enrolled_payload.append({
+            "id":        member.id,
+            "course_id": course.id,
+            "user_id":   user.id,
+            "roles":     member.roles,
+        })
+
+    return {
+        "success": True,
+        "message": f"{len(enrolled_payload)} user(s) enrolled.",
+        "enrolled": enrolled_payload,
+    }
 
 apiv1.add_router("/courses/", enroll_router)
 
-# ─── ANNOUNCEMENT ROUTER: Course Announcements ─────────────
+
+# ─── ANNOUNCEMENTS ─────────────────────────────────────────
 announce_router = Router(auth=auth)
 
 @announce_router.post("/{course_id}/announcements", response=AnnouncementOut)
@@ -86,17 +96,20 @@ def create_announcement(request, course_id: int, data: AnnouncementIn):
 
 @announce_router.get("/{course_id}/announcements", response=List[AnnouncementOut])
 def list_announcements(request, course_id: int):
-    return list(Announcement.objects.filter(
-        course_id=course_id,
-        publish_date__lte=timezone.now()
-    ))
+    return list(
+        Announcement.objects.filter(
+            course_id=course_id,
+            publish_date__lte=timezone.now()
+        )
+    )
 
 @announce_router.put("/{course_id}/announcements/{ann_id}", response=AnnouncementOut)
 def edit_announcement(request, course_id: int, ann_id: int, data: AnnouncementIn):
     ann = Announcement.objects.filter(id=ann_id, course_id=course_id).first()
     if not ann or ann.course.teacher != request.user:
         return Response({"detail": "Forbidden"}, status=403)
-    for k, v in data.dict().items(): setattr(ann, k, v)
+    for k, v in data.dict().items():
+        setattr(ann, k, v)
     ann.save()
     return ann
 
@@ -110,7 +123,8 @@ def delete_announcement(request, course_id: int, ann_id: int):
 
 apiv1.add_router("/courses/", announce_router)
 
-# ─── COMPLETION TRACKER: Content Completion Tracking ───────
+
+# ─── COMPLETION TRACKING ────────────────────────────────────
 completion_router = Router(auth=auth)
 
 @completion_router.post("/completions", response=CompletionOut)
@@ -118,30 +132,58 @@ def add_completion(request, data: CompletionInput):
     content = CourseContent.objects.filter(id=data.content_id).first()
     if not content:
         return Response({"detail": "Content not found."}, status=404)
-    if not CourseMember.objects.filter(course_id=content.course_id, user_id=request.user).exists():
+
+    # only members or teacher may mark complete
+    is_member  = CourseMember.objects.filter(course=content.course, user=request.user).exists()
+    is_teacher = (content.course.teacher == request.user)
+    if not (is_member or is_teacher):
         return Response({"detail": "Forbidden."}, status=403)
-    comp, _ = CompletionTracking.objects.get_or_create(user=request.user, content=content)
-    return comp
+
+    comp, _ = CompletionTracking.objects.get_or_create(
+        user=request.user,
+        content=content
+    )
+    return {
+        "id":         comp.id,
+        "user_id":    comp.user.id,
+        "content_id": comp.content.id,
+    }
 
 @completion_router.get("/courses/{course_id}/completions", response=List[CourseContentMini])
 def show_completions(request, course_id: int):
-    completions = CompletionTracking.objects.filter(
+    qs = CompletionTracking.objects.filter(
         user=request.user,
         content__course_id=course_id
     ).select_related("content")
-    return [ct.content for ct in completions]
+
+    # serialize each content item into schema fields
+    return [
+        {
+            "id":          ct.content.id,
+            "name":        ct.content.name,
+            "description": ct.content.description,
+            "course_id":   ct.content.course.id,
+            "created_at":  ct.content.created_at,
+            "updated_at":  ct.content.updated_at,
+        }
+        for ct in qs
+    ]
 
 @completion_router.delete("/completions/{comp_id}")
 def delete_completion(request, comp_id: int):
-    comp = CompletionTracking.objects.filter(id=comp_id, user_id=request.user).first()
+    comp = CompletionTracking.objects.filter(id=comp_id).first()
     if not comp:
         return Response({"detail": "Not found"}, status=404)
+    # allow owner or course teacher
+    if comp.user != request.user and comp.content.course.teacher != request.user:
+        return Response({"detail": "Forbidden"}, status=403)
     comp.delete()
     return {"success": True}
 
 apiv1.add_router("", completion_router)
 
-# ─── PROFILE ROUTER: Show & Edit Profile ──────────────────
+
+# ─── PROFILE ────────────────────────────────────────────────
 profile_router = Router(auth=auth)
 
 @profile_router.get("/profile/{user_id}", response=ProfileOut)
@@ -150,19 +192,19 @@ def show_profile(request, user_id: int):
     if not user:
         return Response({"detail": "Not found"}, status=404)
     prof, _ = Profile.objects.get_or_create(user=user)
-    enrolled = [cm.course_id for cm in CourseMember.objects.filter(user_id=user)]
-    created = list(Course.objects.filter(teacher=user))
+    enrolled = [m.course for m in CourseMember.objects.filter(user=user)]
+    created  = list(Course.objects.filter(teacher=user))
     return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "handphone": prof.handphone,
-        "description": prof.description,
-        "profile_image": prof.image.url if prof.image else None,
+        "id":             user.id,
+        "username":       user.username,
+        "email":          user.email,
+        "first_name":     user.first_name,
+        "last_name":      user.last_name,
+        "handphone":      prof.handphone,
+        "description":    prof.description,
+        "profile_image":  prof.image.url if prof.image else None,
         "courses_enrolled": enrolled,
-        "courses_created": created,
+        "courses_created":  created,
     }
 
 @profile_router.put("/profile", response=ProfileOut)
@@ -170,28 +212,31 @@ def edit_profile(request, data: ProfileEditInput):
     user = request.user
     prof, _ = Profile.objects.get_or_create(user=user)
     for field, val in data.dict(exclude_unset=True).items():
-        if hasattr(user, field): setattr(user, field, val)
-        else: setattr(prof, field, val)
+        if hasattr(user, field):
+            setattr(user, field, val)
+        else:
+            setattr(prof, field, val)
     user.save()
     prof.save()
-    enrolled = [cm.course_id for cm in CourseMember.objects.filter(user_id=user)]
-    created = list(Course.objects.filter(teacher=user))
+    enrolled = [m.course for m in CourseMember.objects.filter(user=user)]
+    created  = list(Course.objects.filter(teacher=user))
     return {
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "handphone": prof.handphone,
-        "description": prof.description,
-        "profile_image": prof.image.url if prof.image else None,
+        "id":              user.id,
+        "username":        user.username,
+        "email":           user.email,
+        "first_name":      user.first_name,
+        "last_name":       user.last_name,
+        "handphone":       prof.handphone,
+        "description":     prof.description,
+        "profile_image":   prof.image.url if prof.image else None,
         "courses_enrolled": enrolled,
-        "courses_created": created,
+        "courses_created":  created,
     }
 
 apiv1.add_router("", profile_router)
 
-# ─── CATEGORY ROUTER: Course Categories Management ───
+
+# ─── CATEGORIES ────────────────────────────────────────────
 category_router = Router(auth=auth)
 
 @category_router.post("/categories", response=CategoryOut)
@@ -212,14 +257,15 @@ def delete_category(request, cat_id: int):
 
 apiv1.add_router("", category_router)
 
-# ─── BOOKMARK ROUTER: Content Bookmarking (+3) ───────────
+
+# ─── BOOKMARKS ─────────────────────────────────────────────
 bookmark_router = Router(auth=auth)
 
 @bookmark_router.post("/contents/{content_id}/bookmarks", response=BookmarkOut)
 def add_bookmark(request, content_id: int, data: BookmarkIn):
     content = CourseContent.objects.filter(id=content_id).first()
     if not content:
-        return Response({"detail": "Content not found."}, status=404)
+        return Response({"detail": "Not found."}, status=404)
     bm, _ = Bookmark.objects.get_or_create(user=request.user, content=content)
     return bm
 
@@ -237,16 +283,18 @@ def delete_bookmark(request, bookmark_id: int):
 
 apiv1.add_router("", bookmark_router)
 
-# ─── FEEDBACK ROUTER: Course Feedback (+4) ───────────────
+
+# ─── FEEDBACK ──────────────────────────────────────────────
 feedback_router = Router(auth=auth)
 
 @feedback_router.post("/{course_id}/feedback", response=FeedbackOut)
 def add_feedback(request, course_id: int, data: FeedbackIn):
-    course = Course.objects.filter(id=course_id).first()
-    if not course or not CourseMember.objects.filter(course_id=course, user_id=request.user).exists():
+    course  = Course.objects.filter(id=course_id).first()
+    allowed = CourseMember.objects.filter(course=course, user=request.user).exists()
+    if not course or not allowed:
         return Response({"detail": "Forbidden or not found"}, status=403)
     fb, _ = Feedback.objects.update_or_create(
-        course_id=course,
+        course=course,
         user=request.user,
         defaults={"message": data.message, "rating": data.rating}
     )
@@ -262,7 +310,7 @@ def edit_feedback(request, course_id: int, fb_id: int, data: FeedbackIn):
     if not fb:
         return Response({"detail": "Not found or forbidden"}, status=404)
     fb.message = data.message
-    fb.rating = data.rating
+    fb.rating  = data.rating
     fb.save()
     return fb
 
@@ -276,25 +324,27 @@ def delete_feedback(request, course_id: int, fb_id: int):
 
 apiv1.add_router("/courses/", feedback_router)
 
-# ─── DASHBOARD ROUTER: User Activity Dashboard (+1) ────────
+
+# ─── DASHBOARD ─────────────────────────────────────────────
 dashboard_router = Router(auth=auth)
 
 @dashboard_router.get("/dashboard", response=DashboardOut)
 def user_dashboard(request):
-    enrolled_count = CourseMember.objects.filter(user_id=request.user).count()
-    created_count = Course.objects.filter(teacher=request.user).count()
-    comments_count = Comment.objects.filter(member_id__user_id=request.user).count()
+    enrolled_count    = CourseMember.objects.filter(user=request.user).count()
+    created_count     = Course.objects.filter(teacher=request.user).count()
+    comments_count    = Comment.objects.filter(member__user=request.user).count()
     completions_count = CompletionTracking.objects.filter(user=request.user).count()
     return {
-        "courses_enrolled": enrolled_count,
-        "courses_created": created_count,
-        "comments_count": comments_count,
-        "completions_count": completions_count,
+        "courses_enrolled":   enrolled_count,
+        "courses_created":    created_count,
+        "comments_count":     comments_count,
+        "completions_count":  completions_count,
     }
 
 apiv1.add_router("", dashboard_router)
 
-# ─── ANALYTICS ROUTER: Course Analytics (+1) ──────────────
+
+# ─── ANALYTICS ────────────────────────────────────────────
 analytics_router = Router(auth=auth)
 
 @analytics_router.get("/{course_id}/analytics", response=CourseAnalyticsOut)
@@ -302,18 +352,20 @@ def course_analytics(request, course_id: int):
     course = Course.objects.filter(id=course_id).first()
     if not course or (
         course.teacher != request.user and
-        not CourseMember.objects.filter(course_id=course, user_id=request.user).exists()
+        not CourseMember.objects.filter(course=course, user=request.user).exists()
     ):
         return Response({"detail": "Not found or forbidden"}, status=404)
-    members_count  = CourseMember.objects.filter(course_id=course).count()
-    contents_count = CourseContent.objects.filter(course_id=course).count()
-    comments_count = Comment.objects.filter(content_id__course_id=course).count()
-    feedback_count = Feedback.objects.filter(course_id=course).count()
+
+    members_count   = CourseMember.objects.filter(course=course).count()
+    contents_count  = CourseContent.objects.filter(course=course).count()
+    comments_count  = Comment.objects.filter(content__course=course).count()
+    feedback_count  = Feedback.objects.filter(course=course).count()
+
     return {
-        "members_count": members_count,
-        "contents_count": contents_count,
-        "comments_count": comments_count,
-        "feedback_count": feedback_count,
+        "members_count":   members_count,
+        "contents_count":  contents_count,
+        "comments_count":  comments_count,
+        "feedback_count":  feedback_count,
     }
 
 apiv1.add_router("/courses/", analytics_router)
