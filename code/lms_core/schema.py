@@ -64,8 +64,8 @@ class CourseSchemaOut(Schema):
 
 class CourseMemberOut(Schema):
     id: int
-    course_id: CourseSchemaOut
-    user_id: UserOut
+    course_id: int    # simplified to just the course primary key
+    user_id: int      # simplified to just the user primary key
     roles: str
 
 # -------- Content Schemas --------
